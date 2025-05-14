@@ -1,0 +1,1064 @@
+---
+title: "copia imputacio_multiple"
+author: "Carla Iranzo"
+date: '2025-03-18'
+output: html_document
+---
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(mice)
+library(rpart)
+library(randomForest)
+library(grf)
+library(ggplot2)
+library(tidyverse)
+library(lme4) 
+library(truncnorm)
+library(patchwork) 
+library(tidyr)
+library(dplyr)
+```
+
+# Dades 
+ 
+```{r warning=FALSE}
+load("Gynuity_Argentina_oxytocin_IVIM_PPH_Prevention DB.Rdata")
+data <- table
+
+data_clean <- data[!is.na(data$studygrp_AR),]
+data_clean <- data.frame(lapply(data_clean, function(x) ifelse(is.na(x), 0, x)))
+
+variables_a_eliminar <- c(
+   "dar_a_luz",
+   "parto",
+   "enfermedad",
+   "elegible",
+   "participar",
+   "consentimiento",
+   "hipertension_cronica",
+   "segundaro_efecto_AR",
+   "epilepsia"
+)
+data_clean <- data_clean %>%
+  select(-all_of(variables_a_eliminar))
+```
+
+Link de les dades: https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/MDZRKU
+Link al article de les dades: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6772050/
+
+Variable resposta: perdida_sangre_total
+Variable tractament: studygrp_AR
+
+```{r}
+# Identificar les variables categòriques
+categorical_vars <- names(data_clean)[sapply(data_clean, is.character)]
+data_clean <- data_clean[, !(names(data_clean) %in% categorical_vars)]
+``` 
+
+# Descriptiva de les dades 
+
+```{r}
+variables_clau <- data_clean %>%
+  select(
+    studygrp_AR,                  
+    antibioticos,
+    episiotomia,
+    masajeuterino,
+    sutura,
+    HBdrop2ormore,
+    uterotonicos,
+    hpp,
+    indoraug
+  )
+
+summary(variables_clau)
+
+summary(data_clean$perdida_sangre_total)
+ggplot(data_clean, aes(x = perdida_sangre_total)) +
+  geom_histogram(
+    fill = "#69b3a2",
+    color = "white",
+    bins = 30
+  ) +
+  labs(
+    title = "Histograma de la sang perduda total",
+    x = "Sang perduda (ml)",
+    y = "Freqüència"
+  ) +
+  theme_minimal()
+
+```
+
+
+# Funció per calcular l'efecte de tractament individual (PITE) amb Imputacio Multiple
+
+```{r}
+calculate_PITE <- function(data, treatment_var, outcome_var, predictor_vars, train_indices, m, seed) { 
+  # Crear variables contrafactuals (Y_1 i Y_2)
+  data$Y_1 <- ifelse(data[[treatment_var]] == 1, data[[outcome_var]], NA)
+  data$Y_2 <- ifelse(data[[treatment_var]] == 2, data[[outcome_var]], NA)
+  
+  # Dividir dades en train i test
+  set.seed(seed)
+  train_data <- data[train_indices, ]
+  test_data <- data[-train_indices, ]
+  
+  # Imputació múltiple
+  imputed_data <- mice(train_data[, c(predictor_vars, "Y_1", "Y_2")], m = m, seed = seed)
+  
+  # Inicialitzar matriu per emmagatzemar PITE
+  n_test <- nrow(test_data)
+  PITE_iterations <- matrix(NA, nrow = n_test, ncol = m)
+  
+  for (i in 1:m) {
+     completed_data <- complete(imputed_data, i)
+     train_control <- completed_data[train_data[[treatment_var]] == 1, ]
+     train_treatment <- completed_data[train_data[[treatment_var]] == 2, ]
+     
+    # Models contrafactuals
+     model_Y2 <- lm(Y_2 ~ ., data = train_control[, c(predictor_vars, "Y_2")])  # Control → predicció com si fos tractament
+     model_Y1 <- lm(Y_1 ~ ., data = train_treatment[, c(predictor_vars, "Y_1")])  # Tractament → predicció com si fos control
+    
+    # Prediccions sobre tot el conjunt de proves
+    Y_1_pred <- predict(model_Y1, newdata = test_data)
+    Y_2_pred <- predict(model_Y2, newdata = test_data)
+    
+    # Calcular PITE per a aquesta iteració
+    PITE_iter <- Y_2_pred - Y_1_pred
+    var(PITE_iter)
+    PITE_iterations[, i] <- PITE_iter
+  }
+  
+  # Retornar resultats
+  return(list(
+    train_data = train_data,
+    test_data = test_data,
+    imputed_data = imputed_data,
+    PITE_iterations = PITE_iterations
+  ))
+}
+
+# Aplicar la funció
+result <- calculate_PITE(
+  data_clean,
+  treatment_var = "studygrp_AR",
+  outcome_var = "perdida_sangre_total",
+  predictor_vars = c("uterotonicos", "antibioticos", "episiotomia", "masajeuterino", "sutura", "indoraug", "HBdrop2ormore","hpp"),
+  train_indices = c(1:360),
+  m = 1,
+  seed = 123
+)
+var(result$PITE_iterations)
+```
+
+# Funció per calcular l'efecte de tractament individual (PITE) amb Random Forest
+
+```{r}
+calculate_pite_rf <- function(data, outcome_var, treatment_var, predictor_vars, train_indices, seed, ntree, m) {
+  set.seed(seed)
+  
+  #Verificar si la variable treatment_var conte els nivells 1 i 2
+  group_levels <- unique(data[[treatment_var]])
+  if (!all(c(1, 2) %in% group_levels)) {
+    stop(paste("Error: La variable", treatment_var, "ha de contenir els nivells 1 i 2. Nivells presents:", paste(group_levels, collapse = ", ")))
+  }
+  
+  # Dividir les dades en train i test
+  set.seed(seed)
+  train_data <- data[train_indices, ]
+  test_data <- data[-train_indices, ]
+  
+  #Separar les dades per grup de tractament
+  train_control <- train_data %>% filter(!!sym(treatment_var) == 1)
+  train_treatment <- train_data %>% filter(!!sym(treatment_var) == 2)
+  
+  # Inicialitzar matriu per emmagatzemar PITE
+  n_test <- nrow(test_data)
+  PITE_iterations <- matrix(NA, nrow = n_test, ncol = m)
+  
+  for (i in 1:m) {
+    cat("Iteració:", i, "\n")
+    set.seed(seed)
+    #Ajustar model d'arbre de decisió per a cada grup
+    formula <- as.formula(paste(outcome_var, "~", paste(predictor_vars, collapse = " + ")))
+  
+    rf_model_c <- randomForest(formula, data = train_control, ntree = ntree)
+    rf_model_t <- randomForest(formula, data = train_treatment, ntree = ntree)
+    
+    # Predicció per al conjunt de prova
+    Y_1_pred <- predict(rf_model_c, newdata = test_data)
+    Y_2_pred <- predict(rf_model_t, newdata = test_data)
+    
+    # Calcular PITE per a aquesta iteració
+    PITE_iter <- Y_2_pred - Y_1_pred
+    PITE_iterations[, i] <- PITE_iter
+  }
+  
+  return(list(
+    train_data = train_data,
+    test_data = test_data,
+    PITE_iterations = PITE_iterations
+  ))
+}
+
+# Aplicar la funció
+results_rf <- calculate_pite_rf(
+  data_clean,
+  treatment_var = "studygrp_AR",
+  outcome_var = "perdida_sangre_total",
+  predictor_vars = c("ninguna", "antibioticos", "episiotomia", "masajeuterino", "sutura", "indoraug", "HBdrop2ormore"),
+  train_indices = c(1:360),
+  seed = 123,
+  m = 1,
+  ntree = 500
+)
+```
+
+# Funció per calcular l'efecte de tractament individual (PITE) amb RDT
+
+```{r}
+calculate_pite_rdt <- function(data, outcome_var, treatment_var, predictor_vars, train_indices, seed, m, mtry) {
+  
+  # Verificar si la variable treatment_var conté els nivells 1 i 2
+  treatment_levels <- unique(data[[treatment_var]])
+  if (!all(c(1, 2) %in% treatment_levels)) {
+    stop(paste("Error: La variable", treatment_var, "ha de contenir els nivells 1 i 2. Nivells presents:", paste(treatment_levels, collapse = ", ")))
+  }
+  
+  # Dividir les dades en train i test
+  set.seed(seed)
+  train_data <- data[train_indices, ]
+  test_data <- data[-train_indices, ]
+  
+  #Separar les dades per grup de tractament
+  train_control <- train_data %>% filter(!!sym(treatment_var) == 1) 
+  train_treatment <- train_data %>% filter(!!sym(treatment_var) == 2) 
+
+  # Inicialitzar matriu per emmagatzemar PITE
+  n_test <- nrow(test_data)
+  PITE_iterations <- matrix(NA, nrow = n_test, ncol = m)
+  
+  for (i in 1:m) {
+    cat("Iteració:", i, "\n")
+    
+    # Ajustar models d'arbres de decisió per a cada grup
+    formula <- as.formula(paste(outcome_var, "~", paste(predictor_vars, collapse = " + ")))
+    tree_model_c <- rpart(formula, data = train_control, method = "anova", control = rpart.control(mtry = mtry))
+    tree_model_t <- rpart(formula, data = train_treatment, method = "anova", control = rpart.control(mtry = mtry))
+    
+    # Predicció per al conjunt de prova
+    Y_1_pred <- predict(tree_model_c, newdata = test_data)
+    Y_2_pred <- predict(tree_model_t, newdata = test_data)
+    
+    # Calcular PITE per a aquesta iteració
+    PITE_iter <- Y_2_pred - Y_1_pred
+    PITE_iterations[, i] <- PITE_iter
+  }
+  
+  return(list(
+    train_data = train_data,
+    test_data = test_data,
+    PITE_iterations = PITE_iterations
+  ))
+}
+
+# Aplicar la funció
+results_RDT <- calculate_pite_rdt(
+  data_clean,
+  treatment_var = "studygrp_AR",
+  outcome_var = "perdida_sangre_total",
+  predictor_vars = c("ninguna", "antibioticos", "episiotomia", "masajeuterino", "sutura", "indoraug", "HBdrop2ormore"),
+  train_indices = c(1:360),
+  seed = 123,
+  m = 1, mtry = 3
+)
+```
+
+# Funció per calcular l'efecte de tractament individual (PITE) amb Causal Forest
+
+```{r}
+fun_casual_forest <- function(data, treatment_var, outcome_var, predictor_vars, train_indices, m, seed) {
+  
+  set.seed(seed)
+  train_data <- data[train_indices, ]
+  test_data <- data[-train_indices, ]
+  
+  # Definir les covariables i resultat per train
+  X_train <- as.matrix(train_data[, predictor_vars])
+  Y_train <- train_data[[outcome_var]]
+  W_train <- train_data[[treatment_var]]
+
+  # Definir les covariables per test
+  X_test <- as.matrix(test_data[, predictor_vars])
+  n_test <- nrow(test_data)
+
+  # Construir el model causal forest
+  causal_forest_model <- causal_forest(X_train, Y_train, W_train)
+
+  # Inicialitzar matriu per emmagatzemar PITE
+  PITE_iterations <- matrix(NA, nrow = n_test, ncol = m)
+
+  for (i in 1:m) {
+    # Prediccions dels efectes del tractament (individuals) sobre el conjunt de test
+    PITE_iterations[, i] <- predict(causal_forest_model, X_test)$predictions
+  }
+
+  # Retornar els resultats
+  return(list(
+    causal_forest_model = causal_forest_model,
+    PITE_iterations = PITE_iterations,
+    test_data = test_data
+  ))
+}
+
+# Aplicar la funció
+result <- fun_casual_forest(
+  data_clean,
+  treatment_var = "studygrp_AR",
+  outcome_var = "perdida_sangre_total",
+  predictor_vars = c("ninguna", "antibioticos", "episiotomia", "masajeuterino", "sutura", "indoraug", "HBdrop2ormore"),
+  train_indices = c(1:360),
+  m = 1,
+  seed = 123
+)
+```
+
+
+# Simulació
+
+
+## Simulació efecte constant
+
+```{r}
+outcome_var    <- "perdida_sangre_total"
+treatment_var  <- "studygrp_AR"
+predictor_vars <- c("uterotonicos", "antibioticos", "episiotomia", "masajeuterino", "sutura", "indoraug", "HBdrop2ormore","hpp")
+
+set.seed(123456)
+n_cases <- nrow(data_clean)
+n_train <- round(n_cases * 0.75) 
+train_indices <- sample(1:n_cases, n_train, replace = FALSE)
+test_indices <- setdiff(1:n_cases, train_indices)
+m <-50
+
+# Preparar covariables binàries
+covariates <- data_clean[, predictor_vars]
+covariates <- as.data.frame(lapply(covariates, function(x) ifelse(is.na(x), 0, x)))
+
+# Definir un efecte constant per al tractament 
+constant_TE <- 200
+
+# Inicialitzar un dataframe per emmagatzemar les variàncies i les correlacions
+variances <- data.frame()
+metrics <- data.frame()
+
+# Funció per generar covariables binàries
+generate_binomial_covariates <- function(covariate) {
+    p <- prop.table(table(covariate))[[2]]
+    n_cases <- length(covariate)
+    sample(0:1, n_cases, replace = TRUE, prob = c(1 - p, p))
+}
+
+# Bucle de simulació
+for (rep in 1:m) {
+  cat("Repetició:", rep, "\n")
+  
+  # Generar noves covariables binàries
+  for (z in predictor_vars) {
+       z2 <- paste0(z, "_gen")
+       data_clean[, z2] <- covariates[, z2] <- generate_binomial_covariates(covariates[, z])
+   }
+
+  # Assignar un efecte constant per a TE
+  TE <- rep(constant_TE, n_cases) 
+
+  # Generar Y_1 i Y_2 
+  control_group <- data_clean[data_clean[[treatment_var]] == 1, outcome_var]
+  mean_control <- mean(control_group, na.rm = TRUE)
+  sd_control <- sd(control_group, na.rm = TRUE) 
+  
+  Y_1 <- rtruncnorm(n_cases, a = 0, mean = mean_control, sd = sd_control)
+  Y_2 <- Y_1 + TE 
+
+  # Crear la variable de resposta observada segons el tractament
+  data_clean$outcome_observed <- ifelse(data_clean[, treatment_var] == 1, Y_1, Y_2)
+  data_clean$outcome_var <- NULL
+
+  # Aplicar cada mètode i calcular la variància del PITE
+  # 1. Random Forest
+  result_rf <- calculate_pite_rf(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1),
+    ntree = 500
+  )
+  var_rf <- var(result_rf$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_rf <- result_rf$PITE_iterations[, 1]
+  TE_test <- TE[test_indices]
+  corr_rf <- cor(PITE_rf, TE_test, use = "complete.obs")
+  mse_rf <- mean((PITE_rf - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "RandomForest", Correlacio = corr_rf, MSE = mse_rf)
+  )
+  
+  # 2. Imputació múltiple
+  result_pite <- calculate_PITE(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1)
+  )
+  var_pite <- var(result_pite$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_pite <- result_pite$PITE_iterations[, 1]
+  corr_pite <- cor(PITE_pite, TE_test, use = "complete.obs")
+  mse_pite <- mean((PITE_pite - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "ImputacioMultiple", Correlacio = corr_pite, MSE = mse_pite)
+  )
+
+  # 3. Random Decision Trees (RDT)
+  result_rdt <- calculate_pite_rdt(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1)
+  )
+  var_rdt <- var(result_rdt$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_rdt <- result_rdt$PITE_iterations[, 1]
+  corr_rdt <- cor(PITE_rdt, TE_test, use = "complete.obs")
+  mse_rdt <- mean((PITE_rdt - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "RDT", Correlacio = corr_rdt, MSE = mse_rdt)
+  )
+
+  # 4. Causal Forest
+  result_cf <- fun_casual_forest(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1)
+  )
+  var_cf <- var(result_cf$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_cf <- result_cf$PITE_iterations[, 1]
+  corr_cf <- cor(PITE_cf, TE_test, use = "complete.obs")
+  mse_cf <- mean((PITE_cf - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "CausalForest", Correlacio = corr_cf, MSE = mse_cf)
+  )
+  
+  # Variància del TE
+  var_TE <- var(TE[test_indices])
+
+  # Guardar les variàncies en un dataframe
+  variances <- rbind(
+    variances,
+    data.frame(Iteracio = rep, Metode = "RandomForest", Variancia_PITE = var_rf, Variancia_TE = var_TE),
+    data.frame(Iteracio = rep, Metode = "ImputacioMultiple", Variancia_PITE = var_pite, Variancia_TE = var_TE),
+    data.frame(Iteracio = rep, Metode = "RDT", Variancia_PITE = var_rdt, Variancia_TE = var_TE),
+    data.frame(Iteracio = rep, Metode = "CausalForest", Variancia_PITE = var_cf, Variancia_TE = var_TE)
+  )
+}
+
+# Anàlisi descriptiva de les variàncies
+summary_variances <- variances %>%
+  group_by(Metode) %>%
+  summarise(
+    Mitjana_Variancia_PITE = mean(Variancia_PITE),
+    Mitjana_Variancia_TE = mean(Variancia_TE),
+    Relacio_Variancies = mean(Variancia_PITE) / mean(Variancia_TE)
+  )
+print(summary_variances)
+
+# Gràfic
+
+summary_variances_long <- summary_variances %>%
+  pivot_longer(cols = c(Mitjana_Variancia_PITE, Mitjana_Variancia_TE), 
+               names_to = "Tipus_Variancia", 
+               values_to = "Valor")
+
+ggplot(summary_variances_long, aes(x = Metode, y = Valor, fill = Tipus_Variancia)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Mitjana_Variancia_PITE" = "blue", "Mitjana_Variancia_TE" = "red")) +
+  labs(title = "Mitjana de la Variància de PITE i TE per Mètode",
+       x = "Mètode",
+       y = "Mitjana de la Variància",
+       fill = "Tipus de Variància") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+```
+
+## Simulació efecte NO constant i depenent de les variables
+
+```{r}
+outcome_var    <- "perdida_sangre_total"
+treatment_var  <- "studygrp_AR"
+predictor_vars <- c("uterotonicos", "antibioticos", "episiotomia", "masajeuterino", "sutura", "indoraug", "HBdrop2ormore","hpp")
+
+set.seed(123456)
+n_cases <- nrow(data_clean)
+n_train <- round(n_cases * 0.75) 
+train_indices <- sample(1:n_cases, n_train, replace = FALSE)
+test_indices <- setdiff(1:n_cases, train_indices)
+m <- 100
+
+# Preparar covariables binàries
+covariates <- data_clean[, predictor_vars]
+covariates <- as.data.frame(lapply(covariates, function(x) ifelse(is.na(x), 0, x)))
+
+# Definir els coefficients
+coefficients <- (c(-1.3, -1.2, -0.6, 0.3, 0.5, 1.1, 1.2, -0.5) / 0.6) * 400
+
+# Inicialitzar un dataframe per emmagatzemar les variàncies i les correlacions
+variances <- data.frame()
+metrics <- data.frame()
+
+# Funció per generar covariables binàries
+generate_binomial_covariates <- function(covariate) {
+    p <- prop.table(table(covariate))[[2]]
+    n_cases <- length(covariate)
+    sample(0:1, n_cases, replace = TRUE, prob = c(1 - p, p))
+}
+
+# Bucle de simulació
+for (rep in 1:m) {
+  cat("Repetició:", rep, "\n")
+  
+  # Generar noves covariables binàries
+  for (z in predictor_vars) {
+       z2 <- paste0(z, "_gen")
+       data_clean[, z2] <- covariates[, z2] <- generate_binomial_covariates(covariates[, z])
+   }
+
+  # Calcular TE per a cada repetició
+  TE <- as.matrix(covariates[, paste0(predictor_vars, "_gen")]) %*% coefficients
+
+  # Generar Y_1 i Y_2 
+  control_group <- data_clean[data_clean[[treatment_var]] == 1, outcome_var]
+  mean_control <- mean(control_group, na.rm = TRUE)
+  sd_control <- sd(control_group, na.rm = TRUE) 
+  
+  Y_1 <- rtruncnorm(n_cases, a = 0, mean = mean_control, sd = sd_control)
+  Y_2 <- Y_1 + TE
+   
+
+  # Crear la variable de resposta observada segons el tractament
+  data_clean$outcome_observed <- ifelse(data_clean[, treatment_var] == 1, Y_1, Y_2)
+  data_clean$outcome_var <- NULL
+  
+  # Definir variables de soroll 
+  noise_vars <- c("frecuencia_15","tamano_AR","estudios","presion_diast_45","coloco_IV","totalbld1000","frecuencia_60","nivel_hb_4","histerectomia","pre_eclampsia","frecuencia","estadocivil","sangre_30","hora_profilaxis_AR","anti_hipertensivos","totalbld750","sutura","presion_sis","edadgest","presion_diast_60","hora_60","numhijos","frecuencia_30","otra_cirugia","edad","numembarazos","diabetes","cesarea","epidural","presion_sist_30")
+  
+  
+  # Aplicar cada mètode i calcular la variància del PITE
+  # 1. Random Forest
+  result_rf <- calculate_pite_rf(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    # predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    predictor_vars = c(paste0(predictor_vars, "_gen"), noise_vars),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1),
+    ntree = 500
+  )
+  var_rf <- var(result_rf$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_rf <- result_rf$PITE_iterations[, 1]
+  TE_test <- TE[test_indices]
+  corr_rf <- cor(PITE_rf, TE_test, use = "complete.obs")
+  mse_rf <- mean((PITE_rf - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "RandomForest", Correlacio = corr_rf, MSE = mse_rf)
+  )
+  
+  # 2. Imputació múltiple
+  result_pite <- calculate_PITE(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    # predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    predictor_vars = c(paste0(predictor_vars, "_gen"), noise_vars),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1)
+  )
+  var_pite <- var(result_pite$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_pite <- result_pite$PITE_iterations[, 1]
+  corr_pite <- cor(PITE_pite, TE_test, use = "complete.obs")
+  mse_pite <- mean((PITE_pite - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "ImputacioMultiple", Correlacio = corr_pite, MSE = mse_pite)
+  )
+  
+  # 3. Random Decision Trees (RDT)
+  result_rdt <- calculate_pite_rdt(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    # predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    predictor_vars = c(paste0(predictor_vars, "_gen"), noise_vars),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1)
+  )
+  var_rdt <- var(result_rdt$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_rdt <- result_rdt$PITE_iterations[, 1]
+  corr_rdt <- cor(PITE_rdt, TE_test, use = "complete.obs")
+  mse_rdt <- mean((PITE_rdt - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "RDT", Correlacio = corr_rdt, MSE = mse_rdt)
+  )
+  
+  # 4. Causal Forest
+  result_cf <- fun_casual_forest(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    # predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    predictor_vars = c(paste0(predictor_vars, "_gen"), noise_vars),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1)
+  )
+  var_cf <- var(result_cf$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_cf <- result_cf$PITE_iterations[, 1]
+  corr_cf <- cor(PITE_cf, TE_test, use = "complete.obs")
+  mse_cf <- mean((PITE_cf - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "CausalForest", Correlacio = corr_cf, MSE = mse_cf)
+  )
+  
+  # Variància del TE
+  var_TE <- var(TE[test_indices])
+
+  # Guardar les variàncies en un dataframe
+  variances <- rbind(
+    variances,
+    data.frame(Iteracio = rep, Metode = "RandomForest", Variancia_PITE = var_rf, Variancia_TE = var_TE),
+    data.frame(Iteracio = rep, Metode = "ImputacioMultiple", Variancia_PITE = var_pite, Variancia_TE = var_TE),
+    data.frame(Iteracio = rep, Metode = "RDT", Variancia_PITE = var_rdt, Variancia_TE = var_TE),
+    data.frame(Iteracio = rep, Metode = "CausalForest", Variancia_PITE = var_cf, Variancia_TE = var_TE)
+  )
+}
+
+# Anàlisi descriptiva de les variàncies
+summary_variances <- variances %>%
+  group_by(Metode) %>%
+  summarise(
+    Mitjana_Variancia_PITE = mean(Variancia_PITE),
+    Mitjana_Variancia_TE = mean(Variancia_TE),
+    Relacio_Variancies = mean(Variancia_PITE) / mean(Variancia_TE)
+  )
+print(summary_variances)
+
+# Calcular la mitjana de la correlació per a cada mètode
+summary_correlations <- metrics %>%
+  group_by(Metode) %>%
+  summarise(
+    Mitjana_Correlacio = mean(Correlacio, na.rm = TRUE),
+    Desv_Correlacio = sqrt(var(Correlacio, na.rm = TRUE))
+  )
+
+print(summary_correlations)
+
+# Gràfic
+
+summary_variances_long <- summary_variances %>%
+  pivot_longer(cols = c(Mitjana_Variancia_PITE, Mitjana_Variancia_TE), 
+               names_to = "Tipus_Variancia", 
+               values_to = "Valor")
+
+ggplot(summary_variances_long, aes(x = Metode, y = Valor, fill = Tipus_Variancia)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Mitjana_Variancia_PITE" = "blue", "Mitjana_Variancia_TE" = "red")) +
+  labs(title = "Mitjana de la Variància de PITE i TE per Mètode",
+       x = "Mètode",
+       y = "Mitjana de la Variància",
+       fill = "Tipus de Variància") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+## Simulació efecte aleatori
+
+```{r}
+outcome_var    <- "perdida_sangre_total"
+treatment_var  <- "studygrp_AR"
+predictor_vars <- c("uterotonicos", "antibioticos", "episiotomia", "masajeuterino", "sutura", "indoraug", "HBdrop2ormore","hpp")
+
+set.seed(123456)
+n_cases <- nrow(data_clean)
+n_train <- round(n_cases * 0.75) 
+train_indices <- sample(1:n_cases, n_train, replace = FALSE)
+test_indices <- setdiff(1:n_cases, train_indices)
+m <- 100
+
+# Preparar covariables binàries
+covariates <- data_clean[, predictor_vars]
+covariates <- as.data.frame(lapply(covariates, function(x) ifelse(is.na(x), 0, x)))
+variances <- data.frame()
+metrics <- data.frame()
+
+# Funció per generar covariables binàries
+generate_binomial_covariates <- function(covariate) {
+    p <- prop.table(table(covariate))[[2]]
+    n_cases <- length(covariate)
+    sample(0:1, n_cases, replace = TRUE, prob = c(1 - p, p))
+}
+
+# Bucle de simulació
+for (rep in 1:m) {
+  rep <- 1
+  cat("Repetició:", rep, "\n")
+  
+# Inicialitzar un dataframe per emmagatzemar les variàncies i les correlacionsriables binàries
+  for (z in predictor_vars) {
+       z2 <- paste0(z, "_gen")
+       data_clean[, z2] <- covariates[, z2] <- generate_binomial_covariates(covariates[, z])
+   }
+
+  # Simular TE (True Effect) per a cada iteració i generar Y_1 i Y_2
+  control_group <- data_clean[data_clean[[treatment_var]] == 1, outcome_var]
+  mean_control <- mean(control_group, na.rm = TRUE)
+  sd_control <- sd(control_group, na.rm = TRUE) 
+  
+  Y_1 <- rtruncnorm(n_cases, a = 0, mean = mean_control, sd = sd_control)
+  TE <- rtruncnorm(n_cases, a = -Y_1, mean = 0, sd = 100)
+  Y_2 <- Y_1 + TE
+   
+  # Crear la variable de resposta observada segons el tractament
+  data_clean$outcome_observed <- ifelse(data_clean[, treatment_var] == 1, Y_1, Y_2)
+  data_clean$outcome_var <- NULL
+  
+  # Definir variables de soroll 
+  noise_vars <- c()
+
+  # Aplicar cada mètode i calcular la variància del PITE
+  # 1. Random Forest
+  result_rf <- calculate_pite_rf(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    # predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    predictor_vars = c(paste0(predictor_vars, "_gen"), noise_vars),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1),
+    ntree = 500
+  )
+  var_rf <- var(result_rf$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_rf <- result_rf$PITE_iterations[, 1]
+  TE_test <- TE[test_indices]
+  corr_rf <- cor(PITE_rf, TE_test, use = "complete.obs")
+  mse_rf <- mean((PITE_rf - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "RandomForest", Correlacio = corr_rf, MSE = mse_rf)
+  )
+  
+  
+  # 2. Imputació múltiple
+    result_pite <- calculate_PITE(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    # predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    predictor_vars = c(paste0(predictor_vars, "_gen"), noise_vars),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1)
+  )
+  var_pite <- var(result_pite$PITE_iterations[1:(n_cases - n_train),1])
+  print(var_pite)
+  
+  TE_test <- TE[test_indices]
+  PITE_pite <- result_pite$PITE_iterations[, 1]
+  corr_pite <- cor(PITE_pite, TE_test, use = "complete.obs")
+  mse_pite <- mean((PITE_pite - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "RandomForest", Correlacio = corr_pite, MSE = mse_pite)
+  )
+  
+  # 3. Random Decision Trees (RDT)
+  result_rdt <- calculate_pite_rdt(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    # predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    predictor_vars = c(paste0(predictor_vars, "_gen"), noise_vars),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1)
+  )
+  var_rdt <- var(result_rdt$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_rdt <- result_rdt$PITE_iterations[, 1]
+  corr_rdt <- cor(PITE_rdt, TE_test, use = "complete.obs")
+  mse_rdt <- mean((PITE_rdt - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "RDT", Correlacio = corr_rdt, MSE = mse_rdt)
+  )
+  
+  # 4. Causal Forest
+  result_cf <- fun_casual_forest(
+    data_clean,
+    treatment_var = treatment_var,
+    outcome_var = "outcome_observed",
+    # predictor_vars = c(paste0(predictor_vars, "_gen"), setdiff(names(data_clean)[1:30], c("outcome_observed", "outcome_var", treatment_var, predictor_vars, "fecha", "fecha_2", "time_nacimiento", "fecha_ingreso","ID_2","patientID"))),
+    predictor_vars = c(paste0(predictor_vars, "_gen"), noise_vars),
+    train_indices = train_indices,
+    m = 1,
+    seed = sample(1:1000, 1)
+  )
+  var_cf <- var(result_cf$PITE_iterations[1:(n_cases - n_train), 1])
+  PITE_cf <- result_cf$PITE_iterations[, 1]
+  corr_cf <- cor(PITE_cf, TE_test, use = "complete.obs")
+  mse_cf <- mean((PITE_cf - TE_test)^2)
+  metrics <- rbind(
+    metrics,
+    data.frame(Iteracio = rep, Metode = "CausalForest", Correlacio = corr_cf, MSE = mse_cf)
+  )
+  
+  # Variància del TE
+ var_TE <- var(TE[test_indices])
+
+  # Guardar les variàncies en un dataframe
+  variances <- rbind(
+    variances,
+    data.frame(Iteracio = rep, Metode = "RandomForest", Variancia_PITE = var_rf, Variancia_TE = var_TE),
+    data.frame(Iteracio = rep, Metode = "ImputacioMultiple", Variancia_PITE = var_pite, Variancia_TE = var_TE),
+    data.frame(Iteracio = rep, Metode = "RDT", Variancia_PITE = var_rdt, Variancia_TE = var_TE),
+    data.frame(Iteracio = rep, Metode = "CausalForest", Variancia_PITE = var_cf, Variancia_TE = var_TE)
+  )
+}
+
+# Anàlisi descriptiva de les variàncies
+summary_variances <- variances %>%
+  group_by(Metode) %>%
+  summarise(
+    Mitjana_Variancia_PITE = mean(Variancia_PITE),
+    Mitjana_Variancia_TE = mean(Variancia_TE),
+    Relacio_Variancies = mean(Variancia_PITE) / mean(Variancia_TE)
+  )
+print(summary_variances)
+
+# Calcular la mitjana de la correlació per a cada mètode
+summary_correlations <- metrics %>%
+  group_by(Metode) %>%
+  summarise(
+    Mitjana_Correlacio = mean(Correlacio, na.rm = TRUE),
+    Desv_Correlacio = sqrt(var(Correlacio, na.rm = TRUE))
+  )
+
+print(summary_correlations)
+
+# Gràfic
+
+summary_variances_long <- summary_variances %>%
+  pivot_longer(cols = c(Mitjana_Variancia_PITE, Mitjana_Variancia_TE), 
+               names_to = "Tipus_Variancia", 
+               values_to = "Valor")
+
+ggplot(summary_variances_long, aes(x = Metode, y = Valor, fill = Tipus_Variancia)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Mitjana_Variancia_PITE" = "blue", "Mitjana_Variancia_TE" = "red")) +
+  labs(title = "Mitjana de la Variància de PITE i TE per Mètode",
+       x = "Mètode",
+       y = "Mitjana de la Variància",
+       fill = "Tipus de Variància") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+```
+
+# Evolució de la variància segons el nombre de variables soroll
+
+```{r}
+variables <- c(0, 5, 10, 20, 30)
+
+df <- data.frame(
+  NombreVariables = rep(variables, times = 4),
+  VarianciaPITE = c(818.54, 582.50, 532.37, 224.31, 153.84,
+                    16372.87, 18386.71, 33179.92, 53930.32, 85777.07,
+                    7711.50, 35505.64, 41311.83, 51014.32, 51225.63,
+                    5286.22, 11023.54, 10021.72, 10451.75, 7598.93),
+  VarianciaTE = rep(c(9845.08, 9591.75, 10354.91, 8766.85, 10477.05), times = 4),
+  Rati = c(0.08, 0.06, 0.05, 0.025, 0.014,
+           1.66, 1.91, 3.20, 6.15, 8.187,
+           0.78, 3.70, 3.98, 5.81, 4.88,
+           0.54, 1.14, 0.96, 1.19, 0.72),
+  Metode = rep(c("Causal Forest", "Imputació múltiple", "RDT", "Random Forest"), each = 5)
+)
+
+# ---- Gràfic de Variància (PITE i TE) ----
+df_long <- df %>%
+  pivot_longer(cols = c("VarianciaPITE", "VarianciaTE"),
+               names_to = "Tipus", values_to = "Variancia")
+
+graf_variancia <- ggplot(df_long, aes(x = NombreVariables, y = Variancia, color = Tipus)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ Metode, scales = "fixed") +  # mateixa escala per tots
+  scale_y_log10() +
+  scale_color_manual(values = c("VarianciaPITE" = "#1f77b4", "VarianciaTE" = "#ff7f0e")) +
+  labs(
+    title = "Evolució de la variància per mètode (escala logarítmica)",
+    x = "Nombre de variables soroll",
+    y = "Variància (escala log)",
+    color = "Tipus"
+  ) +
+  theme_minimal()
+
+# ---- Gràfic de Rati ----
+graf_rati <- ggplot(df, aes(x = NombreVariables, y = Rati)) +
+  geom_line(aes(color = Metode), size = 1) +
+  geom_point(aes(color = Metode), size = 2) +
+  facet_wrap(~ Metode, scales = "fixed") +
+  labs(
+    title = "Evolució del rati de variàncies per mètode",
+    x = "Nombre de variables soroll",
+    y = "Rati de variància (PITE / TE)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Mostrar els gràfics
+graf_variancia
+graf_rati
+
+```
+
+
+# Evolució de la variància amb la desviació del TE 
+
+```{r}
+desviacio <- c(100, 200, 400)
+
+df2 <- data.frame(
+  ValorDesviacio = rep(desviacio, times = 4),
+  VarianciaPITE = c(1200.22, 7996.68, 96741.67,
+                    104098.51, 166901.06, 424840.29,
+                    70079.43, 128809.72, 352634.48,
+                    13889.75, 39927.09, 183631.22),
+  VarianciaTE = rep(c(25486.52, 101144.6, 445136.2), times = 4),
+  Rati = c(0.04, 0.07, 0.21,
+           4.08, 1.65, 0.95,
+           2.74, 1.27, 0.79,
+           0.54, 0.39, 0.41),
+  Metode = rep(c("Causal Forest", "Imputació múltiple", "RDT", "Random Forest"), each = 3)
+)
+
+# ---- Gràfic de Variància (PITE i TE) ----
+df2_long <- df2 %>% 
+  pivot_longer(cols = c("VarianciaPITE", "VarianciaTE"),
+               names_to = "Tipus", values_to = "Variancia")
+
+graf_variancia2 <- ggplot(df2_long, aes(x = ValorDesviacio, y = Variancia, color = Tipus)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ Metode, scales = "fixed") +
+  scale_y_log10() +
+  scale_color_manual(values = c("VarianciaPITE" = "#1f77b4", "VarianciaTE" = "#ff7f0e")) +
+  labs(
+    title = "Evolució de la variància per valor de desviació (escala logarítmica)",
+    x = "Valor de desviació",
+    y = "Variància (escala log)",
+    color = "Tipus"
+  ) +
+  theme_minimal()
+
+# ---- Gràfic de Rati ----
+graf_rati2 <- ggplot(df2, aes(x = ValorDesviacio, y = Rati)) +
+  geom_line(aes(color = Metode), size = 1) +
+  geom_point(aes(color = Metode), size = 2) +
+  facet_wrap(~ Metode, scales = "fixed") +
+  labs(
+    title = "Evolució del rati de variàncies per valor de desviació",
+    x = "Valor de desviació",
+    y = "Rati de variància (PITE / TE)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Mostrar els gràfics
+graf_variancia2
+graf_rati2
+
+```
+
+
+# Efecte de la mitjana del TE sobre la variància
+
+```{r}
+# Dades actualitzades 
+valor_mitjana <- c(0, -50, -100, -150)
+var_pite <- c(303.36, 512.78, 712.47, 322.01)
+var_te <- c(9700.68, 9926.16, 9730.64, 9876)
+rati <- c(0.03, 0.05, 0.07, 0.03)
+
+# Crear el dataframe
+df <- data.frame(
+  MitjanaTE = valor_mitjana,
+  VarianciaPITE = var_pite,
+  VarianciaTE = var_te,
+  Rati = rati
+)
+
+# Gràfic de variàncies
+graf1 <- ggplot(df, aes(x = MitjanaTE)) +
+  geom_line(aes(y = VarianciaPITE, color = "Variància PITE"), size = 1.2) +
+  geom_line(aes(y = VarianciaTE, color = "Variància TE"), size = 1.2) +
+  geom_point(aes(y = VarianciaPITE, color = "Variància PITE"), size = 3) +
+  geom_point(aes(y = VarianciaTE, color = "Variància TE"), size = 3) +
+  scale_color_manual(values = c("Variància PITE" = "#1f77b4", "Variància TE" = "#ff7f0e")) +
+  scale_y_log10() +
+  labs(
+    title = "Evolució de la variància amb la mitjana del TE",
+    x = "Desviació típica del TE",
+    y = "Valor de la variància",
+    color = "Tipus de variància"
+  ) +
+  theme_minimal()
+
+# Gràfic del rati
+graf2 <- ggplot(df, aes(x = MitjanaTE, y = Rati)) +
+  geom_line(color = "#2ca02c", size = 1.2) +
+  geom_point(color = "#2ca02c", size = 3) +
+  scale_x_continuous(trans = "log10") +
+  labs(
+    title = "Evolució del rati de variàncies (PITE / TE)",
+    x = "Desviació típica del TE",
+    y = "Rati de variàncies"
+  ) +
+  theme_minimal()
+
+# Mostrar els dos gràfics 
+graf1 
+graf2
+
+```
+
